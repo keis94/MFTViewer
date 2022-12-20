@@ -8,6 +8,12 @@ CLI application to read MFT data.
 dotnet new console --target-framework-override net462 -lang 'c#' -o MFTViewer
 ```
 
+## build
+
+```shell
+dotnet build
+```
+
 ## Lisence
 
 This project is licensed under the MIT License, see the LICENSE.txt file for details
