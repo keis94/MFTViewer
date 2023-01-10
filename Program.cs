@@ -38,64 +38,36 @@ public class MFTViewer
 
             var MFTOffset = clusterToByteOffset(boot.MftClusterBlockNumber, boot);
             stream.Seek(MFTOffset, SeekOrigin.Begin);
-
             stream.Seek(0x1c, SeekOrigin.Current);
-            Console.WriteLine("{0:X}", stream.Position);
 
             byte[] blockSizeBytes = new byte[4];
             stream.Read(blockSizeBytes, 0, 4);
-            Console.WriteLine("{0:X}", stream.Position);
-
-            stream.Seek(MFTOffset, SeekOrigin.Begin);
-            Console.WriteLine("{0:X}", stream.Position);
 
             var blockSize = BitConverter.ToInt32(blockSizeBytes, 0);
             Log.Information("blocksize: {0}", blockSize);
 
             var fileBytes = new byte[blockSize];
+            stream.Seek(MFTOffset, SeekOrigin.Begin);
             stream.Read(fileBytes, 0, blockSize);
-            Console.WriteLine("{0:X}", stream.Position);
-            Log.Information("filebytes: {0}", fileBytes);
 
-            var record = new FileRecord(fileBytes, 0, false);
-
-            Log.Information("ActualRecordSize: {0}", record.ActualRecordSize);
-            foreach (PropertyDescriptor descriptor in TypeDescriptor.GetProperties(record))
+            var mftRecord = new FileRecord(fileBytes, 0, false);
+            foreach (var attribute in mftRecord.Attributes.Where(t => t.AttributeType == MFT.Attributes.AttributeType.Data))
             {
-                string name = descriptor.Name;
-                object value = descriptor.GetValue(record);
-                Console.WriteLine("{0}={1}", name, value);
-            }
-
-            foreach (var attr in record.Attributes)
-            {
-                Console.WriteLine("==================");
-                foreach (PropertyDescriptor descriptor in TypeDescriptor.GetProperties(attr))
+                FileStream dumpFile = File.OpenWrite("mft.bin");
+                if (attribute.IsResident)
                 {
-                    string name = descriptor.Name;
-                    object value = descriptor.GetValue(attr);
-                    Console.WriteLine("{0}={1}", name, value);
+                    var data = ((MFT.Attributes.Data)attribute).ResidentData;
+                    dumpFile.Write(data.Data, 0, data.Data.Length);
                 }
-            }
-
-            foreach (var attribute in record.Attributes.Where(t => t.AttributeType == AttributeType.Data))
-            {
-                if (attribute.IsResident == false)
+                else
                 {
-                    Console.WriteLine("----- attribute.ContentOffset: {0:X}", attribute.ContentOffset);
-                    foreach (PropertyDescriptor descriptor in TypeDescriptor.GetProperties(attribute))
-                    {
-                        string name = descriptor.Name;
-                        object value = descriptor.GetValue(attribute);
-                        Console.WriteLine("{0}={1}", name, value);
-                    }
-
-                    FileStream file = File.OpenWrite("mft.bin");
-                    var data = ((Data)attribute).NonResidentData;
+                    var data = ((MFT.Attributes.Data)attribute).NonResidentData;
                     var buffer = new byte[boot.BytesPerSector * boot.SectorsPerCluster];
+                    long dataByteOffset = 0; // Cluster offset is relative value to previous cluster offset. Sum of previous ones must be stored.
                     foreach (var run in data.DataRuns)
                     {
-                        stream.Seek(clusterToByteOffset(run.ClusterOffset, boot), SeekOrigin.Begin);
+                        dataByteOffset += clusterToByteOffset(run.ClusterOffset, boot);
+                        stream.Seek(dataByteOffset, SeekOrigin.Begin);
                         for (ulong i = 0; i < run.ClustersInRun; i++)
                         {
                             var readSize = stream.Read(buffer, 0, buffer.Length);
@@ -104,29 +76,17 @@ public class MFTViewer
                                 Log.Fatal("Failed to read data");
                                 Environment.Exit(-1);
                             }
-                            file.Write(buffer, 0, readSize);
+                            dumpFile.Write(buffer, 0, readSize);
                         }
-                    };
-                    file.Dispose();
-                }
-                else
-                {
-                    Console.WriteLine("----- resident");
-                    foreach (PropertyDescriptor descriptor in TypeDescriptor.GetProperties(attribute))
-                    {
-                        string name = descriptor.Name;
-                        object value = descriptor.GetValue(attribute);
-                        Console.WriteLine("{0}={1}", name, value);
                     }
                 }
+                dumpFile.Dispose();
             }
-
-            // ProcessRecords(new Dictionary<string, FileRecord>({ "mft", record }, false, false, "C", @".\dump", _mft))
-
-            // _mft = new Mft(stream, false);
-            // Log.Information("FILE records found: {0} (Free records: {1}) File size: {2}", _mft.FileRecords.Count, _mft.FreeFileRecords.Count, _mft.FileSize);
-            // ProcessRecords(_mft.FileRecords, false, false, "C", @".\dump", _mft);
         }
+
+        _mft = MftFile.Load("mft.bin", false);
+        Log.Information("FILE records found: {0} (Free records: {1}) File size: {2}", _mft.FileRecords.Count, _mft.FreeFileRecords.Count, _mft.FileSize);
+        ProcessRecords(_mft.FileRecords, false, false, "C", @".\dump", _mft);
     }
 
     private static void ProcessRecords(Dictionary<string, FileRecord> records, bool includeShort, bool alltimestamp, string bdl, string drDumpDir, Mft mft)
@@ -165,8 +125,6 @@ public class MFTViewer
                 }
 
                 var mftr = MFTRecordOut.Create(mft, fr.Value, fn, null, alltimestamp);
-
-                var ads = fr.Value.GetAlternateDataStreams();
 
                 if (String.IsNullOrEmpty(drDumpDir) == false)
                 {
