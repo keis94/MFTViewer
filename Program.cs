@@ -24,11 +24,6 @@ public class MFTViewer
             Environment.Exit(-1);
         }
 
-        long clusterToByteOffset(long clusterOffset, Boot.Boot boot)
-        {
-            return clusterOffset * boot.SectorsPerCluster * boot.BytesPerSector;
-        }
-
         char driveLetter = args[0][0];
         RawDisk disk = new RawDisk(driveLetter);
         using (Stream stream = disk.CreateDiskStream())
@@ -36,58 +31,74 @@ public class MFTViewer
             Boot.Boot boot = new Boot.Boot(stream);
             Log.Information("boot.MftClusterBlockNumber: {0}, boot.SectorsPerCluster: {1}, boot.BytesPerSector: {2}, boot.MftEntrySize: {3}", boot.MftClusterBlockNumber, boot.SectorsPerCluster, boot.BytesPerSector, boot.MftEntrySize, boot.RootDirectoryEntries);
 
-            var MFTOffset = clusterToByteOffset(boot.MftClusterBlockNumber, boot);
-            stream.Seek(MFTOffset, SeekOrigin.Begin);
-            stream.Seek(0x1c, SeekOrigin.Current);
-
-            byte[] blockSizeBytes = new byte[4];
-            stream.Read(blockSizeBytes, 0, 4);
-
-            var blockSize = BitConverter.ToInt32(blockSizeBytes, 0);
-            Log.Information("blocksize: {0}", blockSize);
-
-            var fileBytes = new byte[blockSize];
-            stream.Seek(MFTOffset, SeekOrigin.Begin);
-            stream.Read(fileBytes, 0, blockSize);
-
-            var mftRecord = new FileRecord(fileBytes, 0, false);
-            foreach (var attribute in mftRecord.Attributes.Where(t => t.AttributeType == MFT.Attributes.AttributeType.Data))
-            {
-                FileStream dumpFile = File.OpenWrite("mft.bin");
-                if (attribute.IsResident)
-                {
-                    var data = ((MFT.Attributes.Data)attribute).ResidentData;
-                    dumpFile.Write(data.Data, 0, data.Data.Length);
-                }
-                else
-                {
-                    var data = ((MFT.Attributes.Data)attribute).NonResidentData;
-                    var buffer = new byte[boot.BytesPerSector * boot.SectorsPerCluster];
-                    long dataByteOffset = 0; // Cluster offset is relative value to previous cluster offset. Sum of previous ones must be stored.
-                    foreach (var run in data.DataRuns)
-                    {
-                        dataByteOffset += clusterToByteOffset(run.ClusterOffset, boot);
-                        stream.Seek(dataByteOffset, SeekOrigin.Begin);
-                        for (ulong i = 0; i < run.ClustersInRun; i++)
-                        {
-                            var readSize = stream.Read(buffer, 0, buffer.Length);
-                            if (readSize != buffer.Length)
-                            {
-                                Log.Fatal("Failed to read data");
-                                Environment.Exit(-1);
-                            }
-                            dumpFile.Write(buffer, 0, readSize);
-                        }
-                    }
-                }
-                dumpFile.Dispose();
-            }
+            FileRecord mftRecord = ExtractMFTFileRecord(stream, boot);
+            DumpMFT(mftRecord, stream, boot);
         }
 
         _mft = MftFile.Load("mft.bin", false);
         Log.Information("FILE records found: {0} (Free records: {1}) File size: {2}", _mft.FileRecords.Count, _mft.FreeFileRecords.Count, _mft.FileSize);
         ProcessRecords(_mft.FileRecords, false, false, "C", @".\dump", _mft);
     }
+
+    private static long clusterToByteOffset(long clusterOffset, Boot.Boot boot)
+    {
+        return clusterOffset * boot.SectorsPerCluster * boot.BytesPerSector;
+    }
+
+    private static FileRecord ExtractMFTFileRecord(Stream disk, Boot.Boot boot)
+    {
+        var MFTOffset = clusterToByteOffset(boot.MftClusterBlockNumber, boot);
+        disk.Seek(MFTOffset, SeekOrigin.Begin);
+        disk.Seek(0x1c, SeekOrigin.Current);
+
+        byte[] blockSizeBytes = new byte[4];
+        disk.Read(blockSizeBytes, 0, 4);
+
+        var blockSize = BitConverter.ToInt32(blockSizeBytes, 0);
+        Log.Information("blocksize: {0}", blockSize);
+
+        var fileBytes = new byte[blockSize];
+        disk.Seek(MFTOffset, SeekOrigin.Begin);
+        disk.Read(fileBytes, 0, blockSize);
+
+        return new FileRecord(fileBytes, 0, false);
+    }
+
+    private static void DumpMFT(FileRecord mftRecord, Stream disk, Boot.Boot boot)
+    {
+        foreach (var attribute in mftRecord.Attributes.Where(t => t.AttributeType == MFT.Attributes.AttributeType.Data))
+        {
+            FileStream dumpFile = File.OpenWrite("mft.bin");
+            if (attribute.IsResident)
+            {
+                var data = ((MFT.Attributes.Data)attribute).ResidentData;
+                dumpFile.Write(data.Data, 0, data.Data.Length);
+            }
+            else
+            {
+                var data = ((MFT.Attributes.Data)attribute).NonResidentData;
+                var buffer = new byte[boot.BytesPerSector * boot.SectorsPerCluster];
+                long dataByteOffset = 0; // Cluster offset is relative value to previous cluster offset. Sum of previous ones must be stored.
+                foreach (var run in data.DataRuns)
+                {
+                    dataByteOffset += clusterToByteOffset(run.ClusterOffset, boot);
+                    disk.Seek(dataByteOffset, SeekOrigin.Begin);
+                    for (ulong i = 0; i < run.ClustersInRun; i++)
+                    {
+                        var readSize = disk.Read(buffer, 0, buffer.Length);
+                        if (readSize != buffer.Length)
+                        {
+                            Log.Fatal("Failed to read data");
+                            Environment.Exit(-1);
+                        }
+                        dumpFile.Write(buffer, 0, readSize);
+                    }
+                }
+            }
+            dumpFile.Dispose();
+        }
+    }
+
 
     private static void ProcessRecords(Dictionary<string, FileRecord> records, bool includeShort, bool alltimestamp, string bdl, string drDumpDir, Mft mft)
     {
@@ -110,7 +121,7 @@ public class MFTViewer
             {
                 if (valueAttribute is not LoggedUtilityStream && valueAttribute is not ReparsePoint && valueAttribute is not LoggedUtilityStream && valueAttribute is not VolumeInformation && valueAttribute is not VolumeName && valueAttribute is not StandardInfo && valueAttribute is not Data && valueAttribute is not FileName && valueAttribute is not IndexRoot && valueAttribute is not IndexAllocation && valueAttribute is not Bitmap && valueAttribute is not ObjectId_ && valueAttribute.GetType().Name != "AttributeList")
                 {
-                    Log.Information("E/S: {E}-{S}: {A}", fr.Value.EntryNumber, fr.Value.SequenceNumber, valueAttribute.GetType());
+                    Log.Verbose("E/S: {E}-{S}: {A}", fr.Value.EntryNumber, fr.Value.SequenceNumber, valueAttribute.GetType());
                 }
             }
 
@@ -125,6 +136,20 @@ public class MFTViewer
                 }
 
                 var mftr = MFTRecordOut.Create(mft, fr.Value, fn, null, alltimestamp);
+                var created = mftr.Created0x10 ?? mftr.Created0x30;
+                var lastModified = mftr.LastModified0x10 ?? mftr.LastAccess0x30;
+                var standardInfo = fr.Value.Attributes.Find(t => t.AttributeType == AttributeType.StandardInformation) as MFT.Attributes.StandardInfo;
+                Log.Information(@"{File}
+    From MFTRecourdOut
+        Created: {Created}, Last Modified: {LastModified}
+    From StandardInfomaion
+        CreatedOn: {CreatedOn}, LastAccessedOn: {LastAccessedOn}, RecordModifiedOn: {RecordModifiedOn}, ContentModifiedOn: {ContentModifiedOn}, ",
+                fn.FileInfo.FileName,
+                created, lastModified,
+                standardInfo?.CreatedOn,
+                standardInfo?.LastAccessedOn,
+                standardInfo?.RecordModifiedOn,
+                standardInfo?.ContentModifiedOn);
 
                 if (String.IsNullOrEmpty(drDumpDir) == false)
                 {
@@ -139,10 +164,9 @@ public class MFTViewer
                         }
 
                         var outNameR = Path.Combine(drDumpDir, $"{fr.Value.EntryNumber}-{fr.Value.SequenceNumber}_{fn.FileInfo.FileName}.bin");
-
                         Log.Debug("Saving resident data for {Entry}-{Seq} to {File}", fr.Value.EntryNumber, fr.Value.SequenceNumber, outNameR);
 
-                        File.WriteAllBytes(outNameR, ((Data)da).ResidentData.Data);
+                        // File.WriteAllBytes(outNameR, ((Data)da).ResidentData.Data);
                     }
                 }
             }
